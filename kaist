@@ -1,0 +1,402 @@
+import os
+import json
+import shutil
+from PIL import Image
+import cv2
+import numpy as np
+from pathlib import Path
+import glob
+
+def load_kaist_annotations(annotation_file):
+    """Load KAIST COCO format annotations"""
+    with open(annotation_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    # Create mappings
+    image_id_to_info = {img['id']: img for img in coco_data['images']}
+    category_id_to_name = {cat['id']: cat['name'] for cat in coco_data['categories']}
+    
+    # Group annotations by image_id
+    annotations_by_image = {}
+    for ann in coco_data['annotations']:
+        image_id = ann['image_id']
+        if image_id not in annotations_by_image:
+            annotations_by_image[image_id] = []
+        annotations_by_image[image_id].append(ann)
+    
+    return image_id_to_info, category_id_to_name, annotations_by_image
+
+def get_kaist_class_mapping():
+    """Map KAIST classes to our unified YOLO classes"""
+    kaist_to_yolo_classes = {
+        'person': 0,
+        'people': 0,
+        'pedestrian': 0,
+        'cyclist': 0,  # Person on bicycle - map to person
+        'bicycle': 1,
+        'car': 2,
+        'vehicle': 2,
+        'motorcycle': 3,
+        'bus': 4,
+        'truck': 5,
+    }
+    
+    return kaist_to_yolo_classes
+
+def coco_to_yolo_bbox_CORRECTED(bbox, original_img_width, original_img_height):
+    """
+    CORRECTED: Convert COCO bbox [x, y, width, height] to YOLO format 
+    [x_center, y_center, width, height] normalized using ORIGINAL image dimensions
+    """
+    x, y, w, h = bbox
+    
+    # Convert to center coordinates
+    x_center = x + w / 2
+    y_center = y + h / 2
+    
+    # Normalize by ORIGINAL image dimensions (CRITICAL!)
+    x_center /= original_img_width
+    y_center /= original_img_height
+    w /= original_img_width
+    h /= original_img_height
+    
+    # Clamp to valid range [0, 1]
+    x_center = max(0.0, min(1.0, x_center))
+    y_center = max(0.0, min(1.0, y_center))
+    w = max(0.001, min(1.0, w))
+    h = max(0.001, min(1.0, h))
+    
+    return [x_center, y_center, w, h]
+
+def find_kaist_lwir_image_CORRECTED(image_filename, kaist_base_path, is_test=False):
+    """CORRECTED: Find LWIR image in KAIST dataset structure with better path handling"""
+    
+    # Parse the filename - could be full path or just filename
+    # Examples: 
+    # - "/home/featurize/data/KAIST/kaist_test_anno/train_lwir/set00_V000_I01225.png"
+    # - "set00_V000_I01225.png"
+    # - "I01225.png"
+    
+    # Extract just the filename part
+    actual_filename = os.path.basename(image_filename)
+    
+    if is_test:
+        # Test images are in kaist_test/kaist_test_lwir/
+        test_lwir_path = os.path.join(kaist_base_path, 'kaist_test', 'kaist_test_lwir')
+        if os.path.exists(test_lwir_path):
+            # Try direct filename
+            image_path = os.path.join(test_lwir_path, actual_filename)
+            if os.path.exists(image_path):
+                return image_path
+            
+            # Try parsing set_video_frame format
+            if '_' in actual_filename:
+                parts = actual_filename.split('_')
+                if len(parts) >= 3:
+                    # Extract frame part (I01225.png)
+                    frame_part = parts[-1]  # Should be like I01225.png
+                    frame_path = os.path.join(test_lwir_path, frame_part)
+                    if os.path.exists(frame_path):
+                        return frame_path
+    else:
+        # Training images are in kaist_train/setXX/VXXX/lwir/
+        train_path = os.path.join(kaist_base_path, 'kaist_train')
+        if os.path.exists(train_path):
+            
+            # Try to parse structured filename: set00_V000_I01225.png
+            if '_' in actual_filename and actual_filename.startswith('set'):
+                try:
+                    parts = actual_filename.split('_')
+                    if len(parts) >= 3:
+                        set_part = parts[0]      # set00
+                        video_part = parts[1]    # V000
+                        frame_part = parts[2]    # I01225.png
+                        
+                        # Construct expected path
+                        expected_path = os.path.join(train_path, set_part, video_part, 'lwir', frame_part)
+                        if os.path.exists(expected_path):
+                            return expected_path
+                            
+                except Exception:
+                    pass
+            
+            # Fallback: search through all sets and videos
+            for set_dir in os.listdir(train_path):
+                set_path = os.path.join(train_path, set_dir)
+                if os.path.isdir(set_path):
+                    for video_dir in os.listdir(set_path):
+                        video_path = os.path.join(set_path, video_dir)
+                        if os.path.isdir(video_path):
+                            lwir_path = os.path.join(video_path, 'lwir')
+                            if os.path.exists(lwir_path):
+                                # Try exact filename
+                                image_path = os.path.join(lwir_path, actual_filename)
+                                if os.path.exists(image_path):
+                                    return image_path
+                                
+                                # Try just the frame part if filename has underscores
+                                if '_' in actual_filename:
+                                    frame_part = actual_filename.split('_')[-1]  # Get I01225.png part
+                                    frame_path = os.path.join(lwir_path, frame_part)
+                                    if os.path.exists(frame_path):
+                                        return frame_path
+    
+    return None
+
+def process_kaist_split_CORRECTED(kaist_base_path, output_base_path, annotation_file, split_name, target_size=(640, 512)):
+    """CORRECTED: Process KAIST data with proper bbox normalization"""
+    
+    if not os.path.exists(annotation_file):
+        print(f"Warning: {annotation_file} not found, skipping {split_name}")
+        return
+    
+    print(f"Processing KAIST {split_name} split...")
+    
+    # Load annotations
+    image_id_to_info, category_id_to_name, annotations_by_image = load_kaist_annotations(annotation_file)
+    
+    # Get class mapping
+    kaist_to_yolo_classes = get_kaist_class_mapping()
+    
+    # Output paths - add to existing main_dataset
+    output_images_path = os.path.join(output_base_path, 'main_dataset', split_name, 'images')
+    output_labels_path = os.path.join(output_base_path, 'main_dataset', split_name, 'labels')
+    
+    # Ensure directories exist
+    os.makedirs(output_images_path, exist_ok=True)
+    os.makedirs(output_labels_path, exist_ok=True)
+    
+    processed_count = 0
+    skipped_count = 0
+    coordinate_errors = 0
+    is_test = (split_name == 'test')
+    
+    # Process each image
+    for image_id, image_info in image_id_to_info.items():
+        image_filename = image_info['file_name']
+        
+        # Find the LWIR image
+        image_path = find_kaist_lwir_image_CORRECTED(image_filename, kaist_base_path, is_test)
+        
+        if image_path is None:
+            print(f"Warning: Could not find LWIR image {image_filename}")
+            skipped_count += 1
+            continue
+        
+        # Load original image to get ORIGINAL dimensions (CRITICAL!)
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            print(f"Warning: Could not load image {image_path}")
+            skipped_count += 1
+            continue
+        
+        # Get ORIGINAL dimensions before any resizing
+        original_height, original_width = original_image.shape[:2]
+        
+        # Create unique filename to avoid conflicts
+        clean_filename = os.path.basename(image_filename)
+        base_name = os.path.splitext(clean_filename)[0]
+        extension = os.path.splitext(clean_filename)[1]
+        unique_filename = f"kaist_{split_name}_{base_name}{extension}"
+        
+        # Process annotations for this image USING ORIGINAL DIMENSIONS
+        yolo_annotations = []
+        if image_id in annotations_by_image:
+            for ann in annotations_by_image[image_id]:
+                category_id = ann['category_id']
+                category_name = category_id_to_name.get(category_id, 'unknown')
+                
+                # Map to YOLO class
+                category_lower = category_name.lower()
+                if category_lower in kaist_to_yolo_classes:
+                    yolo_class_id = kaist_to_yolo_classes[category_lower]
+                    
+                    # Convert bbox to YOLO format using ORIGINAL image dimensions
+                    bbox = ann['bbox']
+                    yolo_bbox = coco_to_yolo_bbox_CORRECTED(bbox, original_width, original_height)
+                    
+                    # Validate the converted bbox
+                    x_center, y_center, width, height = yolo_bbox
+                    if (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
+                        0 < width <= 1 and 0 < height <= 1):
+                        yolo_annotations.append([yolo_class_id] + yolo_bbox)
+                    else:
+                        coordinate_errors += 1
+                        print(f"Warning: Invalid coordinates in {image_filename}: {yolo_bbox}")
+        
+        # NOW resize the image (after bbox conversion)
+        resized_image = cv2.resize(original_image, target_size)
+        
+        # Save resized image
+        output_image_path = os.path.join(output_images_path, unique_filename)
+        cv2.imwrite(output_image_path, resized_image)
+        
+        # Save YOLO format label file
+        label_filename = os.path.splitext(unique_filename)[0] + '.txt'
+        label_path = os.path.join(output_labels_path, label_filename)
+        
+        with open(label_path, 'w') as f:
+            for annotation in yolo_annotations:
+                class_id, x_center, y_center, width, height = annotation
+                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+        
+        processed_count += 1
+        if processed_count % 100 == 0:
+            print(f"  Processed {processed_count} images...")
+    
+    print(f"  Completed KAIST {split_name}: {processed_count} images processed, {skipped_count} skipped")
+    if coordinate_errors > 0:
+        print(f"  Warning: {coordinate_errors} coordinate errors found")
+
+def update_dataset_yaml_with_kaist(base_path):
+    """Update the main dataset YAML file to include KAIST data"""
+    yaml_path = os.path.join(base_path, 'main_dataset', 'data.yaml')
+    
+    # Updated class names including KAIST classes
+    class_names = [
+        'person',         # 0 (includes KAIST person, people, pedestrian, cyclist)
+        'bicycle',        # 1
+        'car',           # 2 (includes KAIST car, vehicle)
+        'motorcycle',    # 3
+        'bus',           # 4
+        'truck',         # 5
+        'dog',           # 6
+        'skateboard',    # 7
+        'other_vehicle'  # 8
+    ]
+    
+    yaml_content = f"""# Combined Thermal Dataset Configuration (FLIR + SMOD + IR_det + KAIST) - CORRECTED
+path: {os.path.abspath(os.path.join(base_path, 'main_dataset'))}
+train: train/images
+val: val/images
+test: test/images
+
+# Number of classes
+nc: {len(class_names)}
+
+# Class names
+names: {class_names}
+
+# Sources: FLIR_ADAS_v2, SMOD, IR_det, KAIST
+# Processing: CORRECTED coordinate normalization using original image dimensions
+"""
+    
+    with open(yaml_path, 'w') as f:
+        f.write(yaml_content)
+    
+    print(f"Updated data.yaml with KAIST classes at {yaml_path}")
+
+def validate_kaist_annotations(base_path, num_samples=5):
+    """Validate KAIST annotations to ensure they look correct"""
+    print(f"\n🔍 VALIDATING KAIST ANNOTATIONS")
+    print("=" * 50)
+    
+    train_labels_path = os.path.join(base_path, 'main_dataset', 'train', 'labels')
+    if not os.path.exists(train_labels_path):
+        print("No training labels found for validation")
+        return
+    
+    # Look specifically for KAIST files
+    kaist_files = [f for f in os.listdir(train_labels_path) if f.startswith('kaist_')][:num_samples]
+    
+    if not kaist_files:
+        print("No KAIST files found for validation")
+        return
+    
+    for label_file in kaist_files:
+        label_path = os.path.join(train_labels_path, label_file)
+        print(f"\n📄 {label_file}:")
+        
+        try:
+            with open(label_path, 'r') as f:
+                lines = f.readlines()
+            
+            valid_count = 0
+            invalid_count = 0
+            class_distribution = {}
+            
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    try:
+                        class_id = int(parts[0])
+                        x, y, w, h = map(float, parts[1:5])
+                        
+                        # Track class distribution
+                        class_distribution[class_id] = class_distribution.get(class_id, 0) + 1
+                        
+                        # Check if coordinates are in valid range
+                        if (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+                            valid_count += 1
+                        else:
+                            invalid_count += 1
+                            print(f"   ⚠️  Invalid: class={class_id}, x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
+                    except ValueError:
+                        invalid_count += 1
+            
+            print(f"   ✅ Valid annotations: {valid_count}")
+            print(f"   🎯 Classes found: {class_distribution}")
+            if invalid_count > 0:
+                print(f"   ❌ Invalid annotations: {invalid_count}")
+            else:
+                print(f"   🎯 All KAIST coordinates properly normalized!")
+                
+        except Exception as e:
+            print(f"   Error reading file: {e}")
+
+def main():
+    # Set paths
+    base_path = r"D:\datasets"
+    kaist_path = os.path.join(base_path, "kaist_data")
+    
+    # Verify KAIST dataset exists
+    if not os.path.exists(kaist_path):
+        print(f"Error: KAIST dataset not found at {kaist_path}")
+        return
+    
+    print("🚀 STARTING CORRECTED KAIST PREPROCESSING")
+    print("=" * 60)
+    print(f"Source: {kaist_path}")
+    print(f"Output: Adding to existing main_dataset")
+    print("🔧 CORRECTION: Using original image dimensions for bbox normalization")
+    print("🌡️  Using LWIR (thermal) images - benchmark pedestrian detection")
+    print("🚶 Focus: High-quality person detection in challenging conditions")
+    print("=" * 60)
+    
+    # Check if main_dataset exists
+    main_dataset_path = os.path.join(base_path, 'main_dataset')
+    if not os.path.exists(main_dataset_path):
+        print("Warning: main_dataset folder doesn't exist. Run FLIR preprocessing first.")
+        return
+    
+    # Process LWIR annotations (prioritizing thermal data)
+    anno_path = os.path.join(kaist_path, 'anno', 'sanitized')
+    
+    kaist_files = {
+        'train': os.path.join(anno_path, 'lwir_train.json'),
+        'val': os.path.join(anno_path, 'lwir_test.json'),  # Use test as validation
+    }
+    
+    for split_name, annotation_file in kaist_files.items():
+        if os.path.exists(annotation_file):
+            process_kaist_split_CORRECTED(kaist_path, base_path, annotation_file, split_name, target_size=(640, 512))
+        else:
+            print(f"Warning: {annotation_file} not found, skipping {split_name}")
+    
+    # Update dataset configuration
+    update_dataset_yaml_with_kaist(base_path)
+    
+    # Validate sample annotations
+    validate_kaist_annotations(base_path)
+    
+    print("\n✅ CORRECTED KAIST preprocessing completed!")
+    print("📊 Summary:")
+    print("   - Benchmark-quality thermal person detection dataset")
+    print("   - LWIR images with challenging scenarios (day/night/weather)")
+    print("   - Bounding boxes normalized using ORIGINAL image dimensions")
+    print("   - Fixed complex path parsing for nested directory structure")
+    print("   - All coordinates should now be in valid [0,1] range")
+    print("\nReady for next dataset!")
+
+if __name__ == "__main__":
+    main()
