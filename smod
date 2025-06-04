@@ -1,0 +1,386 @@
+import os
+import json
+import shutil
+from PIL import Image
+import cv2
+import numpy as np
+from pathlib import Path
+
+def load_smod_annotations(annotation_file):
+    """Load SMOD COCO format annotations"""
+    with open(annotation_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    # Create mappings
+    image_id_to_info = {img['id']: img for img in coco_data['images']}
+    category_id_to_name = {cat['id']: cat['name'] for cat in coco_data['categories']}
+    
+    # Group annotations by image_id
+    annotations_by_image = {}
+    for ann in coco_data['annotations']:
+        image_id = ann['image_id']
+        if image_id not in annotations_by_image:
+            annotations_by_image[image_id] = []
+        annotations_by_image[image_id].append(ann)
+    
+    return image_id_to_info, category_id_to_name, annotations_by_image
+
+def get_smod_class_mapping():
+    """Map SMOD classes to our unified YOLO classes"""
+    smod_to_yolo_classes = {
+        'person': 0,        # pedestrians
+        'pedestrian': 0,    # alternate name
+        'rider': 0,         # person on vehicle - map to person
+        'bicycle': 1,       # bicycles
+        'bike': 1,          # alternate name
+        'car': 2,           # cars
+        'vehicle': 2,       # general vehicle - map to car
+        'motorcycle': 3,    # if present
+        'bus': 4,           # if present
+        'truck': 5,         # if present
+    }
+    
+    return smod_to_yolo_classes
+
+def coco_to_yolo_bbox_CORRECTED(bbox, original_img_width, original_img_height):
+    """
+    CORRECTED: Convert COCO bbox [x, y, width, height] to YOLO format 
+    [x_center, y_center, width, height] normalized using ORIGINAL image dimensions
+    """
+    x, y, w, h = bbox
+    
+    # Convert to center coordinates
+    x_center = x + w / 2
+    y_center = y + h / 2
+    
+    # Normalize by ORIGINAL image dimensions (CRITICAL!)
+    x_center /= original_img_width
+    y_center /= original_img_height
+    w /= original_img_width
+    h /= original_img_height
+    
+    # Clamp to valid range [0, 1]
+    x_center = max(0.0, min(1.0, x_center))
+    y_center = max(0.0, min(1.0, y_center))
+    w = max(0.001, min(1.0, w))
+    h = max(0.001, min(1.0, h))
+    
+    return [x_center, y_center, w, h]
+
+def find_smod_image_CORRECTED(image_filename, smod_base_path, prefer_thermal=True):
+    """Find image file in SMOD dataset, preferring thermal images"""
+    
+    # Parse the filename to extract folder and base name
+    if '/' in image_filename:
+        folder, filename = image_filename.split('/', 1)
+    else:
+        folder = None
+        filename = image_filename
+    
+    # Extract base number from filename (e.g., "000000_rgb.jpg" -> "000000")
+    base_name = filename.split('_')[0] if '_' in filename else os.path.splitext(filename)[0]
+    
+    # Define search strategies
+    search_candidates = []
+    
+    if prefer_thermal:
+        # 1. Look for thermal version in day/night folders (_tir.jpg)
+        if folder in ['day', 'night']:
+            thermal_filename = f"{base_name}_tir.jpg"
+            search_candidates.append((os.path.join(smod_base_path, folder), thermal_filename, 'thermal'))
+        
+        # 2. Look in raw thermal folder (just number.jpg)
+        raw_thermal_filename = f"{base_name}.jpg"
+        search_candidates.append((os.path.join(smod_base_path, 'raw', 'night_raw', 'TIR'), raw_thermal_filename, 'thermal'))
+        
+        # 3. Fall back to original RGB version
+        if folder:
+            search_candidates.append((os.path.join(smod_base_path, folder), filename, 'rgb'))
+        
+        # 4. Look in raw RGB folder
+        search_candidates.append((os.path.join(smod_base_path, 'raw', 'night_raw', 'RGB'), raw_thermal_filename, 'rgb'))
+    else:
+        # RGB preference
+        if folder:
+            search_candidates.append((os.path.join(smod_base_path, folder), filename, 'rgb'))
+        
+        raw_filename = f"{base_name}.jpg"
+        search_candidates.append((os.path.join(smod_base_path, 'raw', 'night_raw', 'RGB'), raw_filename, 'rgb'))
+        
+        # Thermal as fallback
+        if folder in ['day', 'night']:
+            thermal_filename = f"{base_name}_tir.jpg"
+            search_candidates.append((os.path.join(smod_base_path, folder), thermal_filename, 'thermal'))
+        
+        search_candidates.append((os.path.join(smod_base_path, 'raw', 'night_raw', 'TIR'), raw_filename, 'thermal'))
+    
+    # Try each candidate
+    for search_path, candidate_filename, image_type in search_candidates:
+        if os.path.exists(search_path):
+            candidate_path = os.path.join(search_path, candidate_filename)
+            if os.path.exists(candidate_path):
+                return candidate_path, f"{search_path} ({image_type})"
+    
+    return None, None
+
+def process_smod_split_CORRECTED(smod_base_path, output_base_path, annotation_file, split_name, target_size=(640, 512)):
+    """CORRECTED: Process SMOD data with proper bbox normalization"""
+    
+    if not os.path.exists(annotation_file):
+        print(f"Warning: {annotation_file} not found, skipping {split_name}")
+        return
+    
+    print(f"Processing SMOD {split_name} split...")
+    
+    # Load annotations
+    image_id_to_info, category_id_to_name, annotations_by_image = load_smod_annotations(annotation_file)
+    
+    # Get class mapping
+    smod_to_yolo_classes = get_smod_class_mapping()
+    
+    # Output paths - add to existing main_dataset
+    output_images_path = os.path.join(output_base_path, 'main_dataset', split_name, 'images')
+    output_labels_path = os.path.join(output_base_path, 'main_dataset', split_name, 'labels')
+    
+    # Ensure directories exist
+    os.makedirs(output_images_path, exist_ok=True)
+    os.makedirs(output_labels_path, exist_ok=True)
+    
+    processed_count = 0
+    skipped_count = 0
+    thermal_count = 0
+    coordinate_errors = 0
+    
+    # Process each image
+    for image_id, image_info in image_id_to_info.items():
+        image_filename = image_info['file_name']
+        
+        # Find the actual image file (prefer thermal)
+        image_path, found_in_folder = find_smod_image_CORRECTED(image_filename, smod_base_path, prefer_thermal=True)
+        
+        if image_path is None:
+            print(f"Warning: Could not find image {image_filename}")
+            skipped_count += 1
+            continue
+        
+        # Track if we're using thermal images
+        if 'TIR' in found_in_folder:
+            thermal_count += 1
+        
+        # Load original image to get ORIGINAL dimensions (CRITICAL!)
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            print(f"Warning: Could not load image {image_path}")
+            skipped_count += 1
+            continue
+        
+        # Get ORIGINAL dimensions before any resizing
+        original_height, original_width = original_image.shape[:2]
+        
+        # Create unique filename to avoid conflicts with FLIR data
+        clean_filename = os.path.basename(image_filename)
+        base_name = os.path.splitext(clean_filename)[0]
+        extension = os.path.splitext(clean_filename)[1]
+        unique_filename = f"smod_{split_name}_{base_name}{extension}"
+        
+        # Process annotations for this image USING ORIGINAL DIMENSIONS
+        yolo_annotations = []
+        if image_id in annotations_by_image:
+            for ann in annotations_by_image[image_id]:
+                category_id = ann['category_id']
+                category_name = category_id_to_name.get(category_id, 'unknown')
+                
+                # Map to YOLO class
+                category_lower = category_name.lower()
+                if category_lower in smod_to_yolo_classes:
+                    yolo_class_id = smod_to_yolo_classes[category_lower]
+                    
+                    # Convert bbox to YOLO format using ORIGINAL image dimensions
+                    bbox = ann['bbox']
+                    yolo_bbox = coco_to_yolo_bbox_CORRECTED(bbox, original_width, original_height)
+                    
+                    # Validate the converted bbox
+                    x_center, y_center, width, height = yolo_bbox
+                    if (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
+                        0 < width <= 1 and 0 < height <= 1):
+                        yolo_annotations.append([yolo_class_id] + yolo_bbox)
+                    else:
+                        coordinate_errors += 1
+                        print(f"Warning: Invalid coordinates in {image_filename}: {yolo_bbox}")
+        
+        # NOW resize the image (after bbox conversion)
+        resized_image = cv2.resize(original_image, target_size)
+        
+        # Save resized image
+        output_image_path = os.path.join(output_images_path, unique_filename)
+        cv2.imwrite(output_image_path, resized_image)
+        
+        # Save YOLO format label file
+        label_filename = os.path.splitext(unique_filename)[0] + '.txt'
+        label_path = os.path.join(output_labels_path, label_filename)
+        
+        with open(label_path, 'w') as f:
+            for annotation in yolo_annotations:
+                class_id, x_center, y_center, width, height = annotation
+                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+        
+        processed_count += 1
+        if processed_count % 100 == 0:
+            print(f"  Processed {processed_count} images...")
+    
+    print(f"  Completed SMOD {split_name}: {processed_count} images processed, {skipped_count} skipped")
+    print(f"  Thermal images used: {thermal_count}/{processed_count}")
+    if coordinate_errors > 0:
+        print(f"  Warning: {coordinate_errors} coordinate errors found")
+
+def update_dataset_yaml_with_smod(base_path):
+    """Update the main dataset YAML file to include SMOD data"""
+    yaml_path = os.path.join(base_path, 'main_dataset', 'data.yaml')
+    
+    # Updated class names including SMOD classes
+    class_names = [
+        'person',         # 0 (includes SMOD person, pedestrian, rider)
+        'bicycle',        # 1 (includes SMOD bicycle, bike)
+        'car',           # 2 (includes SMOD car, vehicle)
+        'motorcycle',    # 3
+        'bus',           # 4
+        'truck',         # 5
+        'dog',           # 6
+        'skateboard',    # 7
+        'other_vehicle'  # 8
+    ]
+    
+    yaml_content = f"""# Combined Thermal Dataset Configuration (FLIR + SMOD) - CORRECTED
+path: {os.path.abspath(os.path.join(base_path, 'main_dataset'))}
+train: train/images
+val: val/images
+test: test/images
+
+# Number of classes
+nc: {len(class_names)}
+
+# Class names
+names: {class_names}
+
+# Sources: FLIR_ADAS_v2, SMOD
+# Processing: CORRECTED coordinate normalization using original image dimensions
+"""
+    
+    with open(yaml_path, 'w') as f:
+        f.write(yaml_content)
+    
+    print(f"Updated data.yaml with SMOD classes at {yaml_path}")
+
+def validate_smod_annotations(base_path, num_samples=5):
+    """Validate SMOD annotations to ensure they look correct"""
+    print(f"\n🔍 VALIDATING SMOD ANNOTATIONS")
+    print("=" * 50)
+    
+    train_labels_path = os.path.join(base_path, 'main_dataset', 'train', 'labels')
+    if not os.path.exists(train_labels_path):
+        print("No training labels found for validation")
+        return
+    
+    # Look specifically for SMOD files
+    smod_files = [f for f in os.listdir(train_labels_path) if f.startswith('smod_')][:num_samples]
+    
+    if not smod_files:
+        print("No SMOD files found for validation")
+        return
+    
+    for label_file in smod_files:
+        label_path = os.path.join(train_labels_path, label_file)
+        print(f"\n📄 {label_file}:")
+        
+        try:
+            with open(label_path, 'r') as f:
+                lines = f.readlines()
+            
+            valid_count = 0
+            invalid_count = 0
+            class_distribution = {}
+            
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    try:
+                        class_id = int(parts[0])
+                        x, y, w, h = map(float, parts[1:5])
+                        
+                        # Track class distribution
+                        class_distribution[class_id] = class_distribution.get(class_id, 0) + 1
+                        
+                        # Check if coordinates are in valid range
+                        if (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+                            valid_count += 1
+                        else:
+                            invalid_count += 1
+                            print(f"   ⚠️  Invalid: class={class_id}, x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
+                    except ValueError:
+                        invalid_count += 1
+            
+            print(f"   ✅ Valid annotations: {valid_count}")
+            print(f"   🎯 Classes found: {class_distribution}")
+            if invalid_count > 0:
+                print(f"   ❌ Invalid annotations: {invalid_count}")
+            else:
+                print(f"   🎯 All SMOD coordinates properly normalized!")
+                
+        except Exception as e:
+            print(f"   Error reading file: {e}")
+
+def main():
+    # Set paths
+    base_path = r"D:\datasets"
+    smod_path = os.path.join(base_path, "SMOD")
+    
+    # Verify SMOD dataset exists
+    if not os.path.exists(smod_path):
+        print(f"Error: SMOD dataset not found at {smod_path}")
+        return
+    
+    print("🚀 STARTING CORRECTED SMOD PREPROCESSING")
+    print("=" * 60)
+    print(f"Source: {smod_path}")
+    print(f"Output: Adding to existing main_dataset")
+    print("🔧 CORRECTION: Using original image dimensions for bbox normalization")
+    print("🌡️  Prioritizing thermal images (TIR) over RGB")
+    print("=" * 60)
+    
+    # Check if main_dataset exists
+    main_dataset_path = os.path.join(base_path, 'main_dataset')
+    if not os.path.exists(main_dataset_path):
+        print("Warning: main_dataset folder doesn't exist. Run FLIR preprocessing first.")
+        return
+    
+    # Process train and test splits
+    anno_path = os.path.join(smod_path, 'anno')
+    
+    # Map SMOD annotations to our splits
+    smod_files = {
+        'train': os.path.join(anno_path, 'new_train_annotations_rgb.json'),
+        'val': os.path.join(anno_path, 'new_test_annotations_rgb.json'),  # Use test as validation
+    }
+    
+    for split_name, annotation_file in smod_files.items():
+        if os.path.exists(annotation_file):
+            process_smod_split_CORRECTED(smod_path, base_path, annotation_file, split_name, target_size=(640, 512))
+        else:
+            print(f"Warning: {annotation_file} not found, skipping {split_name}")
+    
+    # Update dataset configuration
+    update_dataset_yaml_with_smod(base_path)
+    
+    # Validate sample annotations
+    validate_smod_annotations(base_path)
+    
+    print("\n✅ CORRECTED SMOD preprocessing completed!")
+    print("📊 Summary:")
+    print("   - Dense urban scenes with people, riders, bicycles, cars")
+    print("   - Prioritized thermal (TIR) images over RGB")
+    print("   - Bounding boxes normalized using ORIGINAL image dimensions")
+    print("   - All coordinates should now be in valid [0,1] range")
+    print("\nReady for next dataset!")
+
+if __name__ == "__main__":
+    main()
