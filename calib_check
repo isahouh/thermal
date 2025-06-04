@@ -1,0 +1,62 @@
+import random, cv2, numpy as np, imghdr, shutil
+from pathlib import Path
+
+# ------------------- CONFIG -------------------------------------------------
+DATASET_ROOT = Path(r"D:/datasets/main_dataset")
+SRC_DIR      = DATASET_ROOT / "train" / "images"
+DEST_DIR     = DATASET_ROOT / "calibration" / "images"
+N_SAMPLE     = 400
+VALID_TYPES  = {"jpeg", "png", "bmp", "tiff"}
+USE_KEYWORDS = True                      # set False to ignore name hints
+KEYWORDS     = {"thermal", "ir", "flir"} # lower-case substrings
+GRAY_THR     = 3                         # ≤3 intensity spread → “gray”
+
+# ------------------- HELPERS ------------------------------------------------
+def is_maybe_thermal(img_path: Path, img_np: np.ndarray) -> bool:
+    """Reject obvious RGB photos; keep true greyscale or near-grey."""
+    if USE_KEYWORDS and not any(k in img_path.stem.lower() for k in KEYWORDS):
+        return False
+
+    if img_np.ndim == 2:                             # uint8 HxW
+        return True
+    if img_np.ndim == 3 and img_np.shape[2] == 1:    # HxWx1
+        return True
+    if img_np.ndim == 3 and img_np.shape[2] == 3:
+        # colour?  measure max per-pixel channel difference
+        diff = np.max(np.abs(img_np.astype(int) - img_np[..., :1]), axis=2)
+        return diff.max() <= GRAY_THR                # near-identical channels
+    return False
+
+def to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
+    """16-bit ➔ 8-bit, greyscale ➔ 3-channel RGB."""
+    if arr.dtype == np.uint16:
+        arr = (arr >> 8).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = cv2.normalize(arr, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 1:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    return arr
+
+# ------------------- BUILD SET ----------------------------------------------
+DEST_DIR.mkdir(parents=True, exist_ok=True)
+candidates = [p for p in SRC_DIR.rglob("*") if p.is_file() and imghdr.what(p) in VALID_TYPES]
+random.shuffle(candidates)
+
+kept = skipped = 0
+for src in candidates:
+    if kept >= N_SAMPLE:
+        break
+    raw = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+    if raw is None or not is_maybe_thermal(src, raw):
+        skipped += 1
+        continue
+    fixed = to_uint8_rgb(raw)
+    cv2.imwrite(str(DEST_DIR / (src.stem + ".png")), fixed)
+    kept += 1
+
+print(f"✔  Saved {kept} thermal frames to {DEST_DIR}")
+if skipped:
+    print(f"⚠  Skipped {skipped} images (non-thermal or unreadable)")
