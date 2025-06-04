@@ -1,0 +1,405 @@
+import os
+import yaml
+import shutil
+from PIL import Image
+import cv2
+import numpy as np
+from pathlib import Path
+
+def get_updated_class_mapping():
+    """Get updated class mapping including deer"""
+    # Extended class mapping to include wildlife
+    unified_classes = {
+        0: 'person',
+        1: 'bicycle', 
+        2: 'car',
+        3: 'motorcycle',
+        4: 'bus',
+        5: 'truck',
+        6: 'dog',
+        7: 'deer',          # NEW wildlife class
+        8: 'skateboard',    # Keep existing classes
+        9: 'other_vehicle'  # Keep existing classes
+    }
+    
+    return unified_classes
+
+def resize_image_with_padding(image, target_size):
+    """
+    Resize image to target size while maintaining aspect ratio and padding with black.
+    Works for both upscaling (small images) and downscaling (large images).
+    Returns resized image and transformation parameters.
+    """
+    target_width, target_height = target_size
+    orig_height, orig_width = image.shape[:2]
+    
+    # Calculate scale factor to fit image within target size
+    scale = min(target_width / orig_width, target_height / orig_height)
+    
+    # Calculate new dimensions
+    new_width = int(orig_width * scale)
+    new_height = int(orig_height * scale)
+    
+    # Resize image (works for both upscaling and downscaling)
+    resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+    
+    # Create padded image with black background
+    padded = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    
+    # Calculate padding offsets (center the image)
+    x_offset = (target_width - new_width) // 2
+    y_offset = (target_height - new_height) // 2
+    
+    # Place resized image in center
+    padded[y_offset:y_offset + new_height, x_offset:x_offset + new_width] = resized
+    
+    # Return padded image and transformation info
+    transform_info = {
+        'scale': scale,
+        'x_offset': x_offset,
+        'y_offset': y_offset,
+        'new_width': new_width,
+        'new_height': new_height
+    }
+    
+    return padded, transform_info
+
+def transform_yolo_annotations(annotations, transform_info, target_size):
+    """
+    Transform YOLO annotations to account for padding and resizing.
+    YOLO format: [class_id, x_center, y_center, width, height] (all normalized 0-1)
+    """
+    transformed_annotations = []
+    target_width, target_height = target_size
+    
+    for ann in annotations:
+        class_id, x_center, y_center, width, height = ann
+        
+        # Scale coordinates to padded image dimensions
+        # Original coordinates are normalized (0-1), so we need to:
+        # 1. Scale them to the resized (but not padded) dimensions
+        # 2. Add the offset from padding
+        # 3. Normalize back to 0-1 for the target size
+        
+        # Convert to pixel coordinates in resized image
+        x_pixel = x_center * transform_info['new_width']
+        y_pixel = y_center * transform_info['new_height']
+        w_pixel = width * transform_info['new_width']
+        h_pixel = height * transform_info['new_height']
+        
+        # Add padding offset
+        x_pixel += transform_info['x_offset']
+        y_pixel += transform_info['y_offset']
+        
+        # Convert back to normalized coordinates for target size
+        x_norm = x_pixel / target_width
+        y_norm = y_pixel / target_height
+        w_norm = w_pixel / target_width
+        h_norm = h_pixel / target_height
+        
+        # Ensure coordinates are within bounds
+        x_norm = max(0.0, min(1.0, x_norm))
+        y_norm = max(0.0, min(1.0, y_norm))
+        w_norm = max(0.001, min(1.0, w_norm))
+        h_norm = max(0.001, min(1.0, h_norm))
+        
+        transformed_annotations.append([class_id, x_norm, y_norm, w_norm, h_norm])
+    
+    return transformed_annotations
+
+def validate_and_fix_yolo_label(label_file):
+    """Validate YOLO format label file and ensure coordinates are properly normalized"""
+    annotations = []
+    
+    try:
+        with open(label_file, 'r') as f:
+            lines = f.readlines()
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    # YOLO format: class_id x_center y_center width height
+                    original_class_id = int(parts[0])
+                    x_center = float(parts[1])
+                    y_center = float(parts[2])
+                    width = float(parts[3])
+                    height = float(parts[4])
+                    
+                    # Map to our deer class (class 7)
+                    unified_class_id = 7  # All deer types → deer
+                    
+                    # Validate coordinates are in [0,1] range
+                    if (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
+                        0 < width <= 1 and 0 < height <= 1):
+                        annotations.append([unified_class_id, x_center, y_center, width, height])
+                    else:
+                        print(f"Warning: Invalid coordinates in line: {line}")
+                    
+                except ValueError:
+                    print(f"Warning: Could not parse line: {line}")
+                    continue
+    
+    except Exception as e:
+        print(f"Warning: Error reading label file {label_file}: {e}")
+    
+    return annotations
+
+def process_roe_deer_split_CORRECTED(roe_deer_base_path, output_base_path, split_name, target_size=(640, 512)):
+    """CORRECTED: Process Roe deer data with aspect ratio preservation"""
+    
+    # Map valid to val for consistency
+    output_split = 'val' if split_name == 'valid' else split_name
+    
+    split_path = os.path.join(roe_deer_base_path, split_name)
+    if not os.path.exists(split_path):
+        print(f"Warning: Split {split_name} not found at {split_path}")
+        return
+    
+    images_path = os.path.join(split_path, 'images')
+    labels_path = os.path.join(split_path, 'labels')
+    
+    if not os.path.exists(images_path):
+        print(f"Warning: Images folder not found at {images_path}")
+        return
+    
+    if not os.path.exists(labels_path):
+        print(f"Warning: Labels folder not found at {labels_path}")
+        return
+    
+    print(f"Processing Roe deer {split_name} split...")
+    
+    # Output paths - add to existing main_dataset
+    output_images_path = os.path.join(output_base_path, 'main_dataset', output_split, 'images')
+    output_labels_path = os.path.join(output_base_path, 'main_dataset', output_split, 'labels')
+    
+    # Ensure directories exist
+    os.makedirs(output_images_path, exist_ok=True)
+    os.makedirs(output_labels_path, exist_ok=True)
+    
+    # Get all images
+    image_files = [f for f in os.listdir(images_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    
+    processed_count = 0
+    skipped_count = 0
+    coordinate_errors = 0
+    size_stats = {'smaller': 0, 'larger': 0, 'exact': 0}
+    
+    for image_filename in image_files:
+        image_path = os.path.join(images_path, image_filename)
+        
+        # Find corresponding label file
+        base_name = os.path.splitext(image_filename)[0]
+        label_file = os.path.join(labels_path, base_name + '.txt')
+        
+        if not os.path.exists(label_file):
+            print(f"Warning: No label found for {image_filename}")
+            skipped_count += 1
+            continue
+        
+        # Load original image
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            print(f"Warning: Could not load image {image_path}")
+            skipped_count += 1
+            continue
+        
+        # Track image size relative to target
+        orig_h, orig_w = original_image.shape[:2]
+        if orig_w < target_size[0] or orig_h < target_size[1]:
+            size_stats['smaller'] += 1
+        elif orig_w > target_size[0] or orig_h > target_size[1]:
+            size_stats['larger'] += 1
+        else:
+            size_stats['exact'] += 1
+        
+        # Resize image with padding to maintain aspect ratio
+        padded_image, transform_info = resize_image_with_padding(original_image, target_size)
+        
+        # Create unique filename
+        clean_filename = os.path.basename(image_filename)
+        base_name = os.path.splitext(clean_filename)[0]
+        extension = os.path.splitext(clean_filename)[1]
+        unique_filename = f"roe_deer_{output_split}_{base_name}{extension}"
+        
+        # Save padded image
+        output_image_path = os.path.join(output_images_path, unique_filename)
+        cv2.imwrite(output_image_path, padded_image)
+        
+        # Parse and validate existing YOLO annotations
+        original_annotations = validate_and_fix_yolo_label(label_file)
+        
+        # Transform annotations to account for padding
+        transformed_annotations = transform_yolo_annotations(original_annotations, transform_info, target_size)
+        
+        if not transformed_annotations:
+            coordinate_errors += 1
+        
+        # Save YOLO format label file with transformed coordinates
+        label_filename = os.path.splitext(unique_filename)[0] + '.txt'
+        label_path = os.path.join(output_labels_path, label_filename)
+        
+        with open(label_path, 'w') as f:
+            for annotation in transformed_annotations:
+                class_id, x_center, y_center, width, height = annotation
+                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+        
+        processed_count += 1
+        if processed_count % 50 == 0:
+            print(f"  Processed {processed_count} images...")
+    
+    print(f"  Completed Roe deer {split_name}: {processed_count} images processed, {skipped_count} skipped")
+    print(f"  Image sizes: {size_stats['smaller']} smaller, {size_stats['larger']} larger, {size_stats['exact']} exact match")
+    if coordinate_errors > 0:
+        print(f"  Files with no valid annotations: {coordinate_errors}")
+
+def update_dataset_yaml_with_deer(base_path):
+    """Update the main dataset YAML file to include deer class"""
+    yaml_path = os.path.join(base_path, 'main_dataset', 'data.yaml')
+    
+    # Updated class names including deer
+    class_names = [
+        'person',         # 0
+        'bicycle',        # 1  
+        'car',           # 2
+        'motorcycle',    # 3
+        'bus',           # 4
+        'truck',         # 5
+        'dog',           # 6
+        'deer',          # 7 - NEW wildlife class
+        'skateboard',    # 8
+        'other_vehicle'  # 9
+    ]
+    
+    yaml_content = f"""# Combined Thermal Dataset Configuration (ALL MAJOR DATASETS + DEER) - CORRECTED
+path: {os.path.abspath(os.path.join(base_path, 'main_dataset'))}
+train: train/images
+val: val/images
+test: test/images
+
+# Number of classes
+nc: {len(class_names)}
+
+# Class names
+names: {class_names}
+
+# Sources: FLIR_ADAS_v2, SMOD, IR_det, KAIST, LLVIP, CVC14, Roe_deer
+# Processing: CORRECTED - Aspect ratio preserved with black padding
+"""
+    
+    with open(yaml_path, 'w') as f:
+        f.write(yaml_content)
+    
+    print(f"Updated data.yaml with deer class at {yaml_path}")
+
+def validate_roe_deer_annotations(base_path, num_samples=5):
+    """Validate Roe deer annotations to ensure they look correct"""
+    print(f"\n🔍 VALIDATING ROE DEER ANNOTATIONS")
+    print("=" * 50)
+    
+    train_labels_path = os.path.join(base_path, 'main_dataset', 'train', 'labels')
+    if not os.path.exists(train_labels_path):
+        print("No training labels found for validation")
+        return
+    
+    # Look specifically for Roe deer files
+    deer_files = [f for f in os.listdir(train_labels_path) if f.startswith('roe_deer_')][:num_samples]
+    
+    if not deer_files:
+        print("No Roe deer files found for validation")
+        return
+    
+    for label_file in deer_files:
+        label_path = os.path.join(train_labels_path, label_file)
+        print(f"\n📄 {label_file}:")
+        
+        try:
+            with open(label_path, 'r') as f:
+                lines = f.readlines()
+            
+            valid_count = 0
+            invalid_count = 0
+            class_distribution = {}
+            
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    try:
+                        class_id = int(parts[0])
+                        x, y, w, h = map(float, parts[1:5])
+                        
+                        # Track class distribution
+                        class_distribution[class_id] = class_distribution.get(class_id, 0) + 1
+                        
+                        # Check if coordinates are in valid range
+                        if (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+                            valid_count += 1
+                        else:
+                            invalid_count += 1
+                            print(f"   ⚠️  Invalid: class={class_id}, x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
+                    except ValueError:
+                        invalid_count += 1
+            
+            print(f"   ✅ Valid annotations: {valid_count}")
+            print(f"   🦌 Classes found: {class_distribution} (should be class 7 = deer)")
+            if invalid_count > 0:
+                print(f"   ❌ Invalid annotations: {invalid_count}")
+            else:
+                print(f"   🎯 All Roe deer coordinates properly normalized!")
+                
+        except Exception as e:
+            print(f"   Error reading file: {e}")
+
+def main():
+    # Set paths
+    base_path = r"D:\datasets"
+    roe_deer_path = os.path.join(base_path, "Roe deer.v1i.yolov11")
+    
+    # Verify Roe deer dataset exists
+    if not os.path.exists(roe_deer_path):
+        print(f"Error: Roe deer dataset not found at {roe_deer_path}")
+        return
+    
+    print("🚀 STARTING ROE DEER PREPROCESSING (WILDLIFE)")
+    print("=" * 60)
+    print(f"Source: {roe_deer_path}")
+    print(f"Output: Adding to existing main_dataset")
+    print("🖼️ IMAGE PROCESSING: Aspect ratio preserved with black padding")
+    print("🦌 WILDLIFE: All deer detections mapped to class 7 (deer)")
+    print("✅ HANDLES: Both smaller and larger images than 640x512")
+    print("=" * 60)
+    
+    # Check if main_dataset exists
+    main_dataset_path = os.path.join(base_path, 'main_dataset')
+    if not os.path.exists(main_dataset_path):
+        print("Warning: main_dataset folder doesn't exist. Run thermal datasets first.")
+        return
+    
+    # Process train, valid, and test splits
+    splits = ['train', 'valid', 'test']
+    for split in splits:
+        process_roe_deer_split_CORRECTED(roe_deer_path, base_path, split, target_size=(640, 512))
+    
+    # Update the dataset YAML file to include deer class
+    update_dataset_yaml_with_deer(base_path)
+    
+    # Validate sample annotations
+    validate_roe_deer_annotations(base_path)
+    
+    print("\n✅ ROE DEER preprocessing completed!")
+    print("📊 Summary:")
+    print("   - Thermal deer detection data added (Roboflow quality)")
+    print("   - All deer mapped to class 7 for unified wildlife detection")
+    print("   - Aspect ratio preserved with black padding")
+    print("   - Annotations correctly transformed for padded images")
+    print("   - Works for both upscaling and downscaling")
+    print("   - Images resized to 640x512 for FLIR ADK compatibility")
+    print("   - Ready for additional wildlife datasets (szarvas, game pics)")
+    print("\nWildlife detection capability: ENABLED! 🦌")
+
+if __name__ == "__main__":
+    main()
