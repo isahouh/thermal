@@ -1,0 +1,319 @@
+import os
+import json
+import shutil
+from PIL import Image
+import cv2
+import numpy as np
+from pathlib import Path
+
+def create_directory_structure(base_path):
+    """Create YOLO-style directory structure"""
+    directories = [
+        'main_dataset/train/images',
+        'main_dataset/train/labels', 
+        'main_dataset/val/images',
+        'main_dataset/val/labels',
+        'main_dataset/test/images',
+        'main_dataset/test/labels'
+    ]
+    
+    for directory in directories:
+        Path(os.path.join(base_path, directory)).mkdir(parents=True, exist_ok=True)
+    
+    print("Created main_dataset directory structure")
+
+def load_coco_annotations(coco_file):
+    """Load COCO format annotations"""
+    with open(coco_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    # Create mappings
+    image_id_to_info = {img['id']: img for img in coco_data['images']}
+    category_id_to_name = {cat['id']: cat['name'] for cat in coco_data['categories']}
+    
+    # Group annotations by image_id
+    annotations_by_image = {}
+    for ann in coco_data['annotations']:
+        image_id = ann['image_id']
+        if image_id not in annotations_by_image:
+            annotations_by_image[image_id] = []
+        annotations_by_image[image_id].append(ann)
+    
+    return image_id_to_info, category_id_to_name, annotations_by_image
+
+def get_flir_class_mapping():
+    """Define class mapping for FLIR dataset"""
+    flir_to_yolo_classes = {
+        'person': 0,
+        'bicycle': 1, 
+        'car': 2,
+        'motorcycle': 3,
+        'bus': 4,
+        'truck': 5,
+        'dog': 6,
+        'skateboard': 7,
+        'other vehicle': 8
+    }
+    
+    class_names = [
+        'person',         # 0
+        'bicycle',        # 1  
+        'car',           # 2
+        'motorcycle',    # 3
+        'bus',           # 4
+        'truck',         # 5
+        'dog',           # 6
+        'skateboard',    # 7
+        'other_vehicle'  # 8
+    ]
+    
+    return flir_to_yolo_classes, class_names
+
+def coco_to_yolo_bbox_CORRECTED(bbox, original_img_width, original_img_height):
+    """
+    CORRECTED: Convert COCO bbox [x, y, width, height] to YOLO format 
+    [x_center, y_center, width, height] normalized using ORIGINAL image dimensions
+    """
+    x, y, w, h = bbox
+    
+    # Convert to center coordinates
+    x_center = x + w / 2
+    y_center = y + h / 2
+    
+    # Normalize by ORIGINAL image dimensions (CRITICAL!)
+    x_center /= original_img_width
+    y_center /= original_img_height
+    w /= original_img_width
+    h /= original_img_height
+    
+    # Clamp to valid range [0, 1]
+    x_center = max(0.0, min(1.0, x_center))
+    y_center = max(0.0, min(1.0, y_center))
+    w = max(0.001, min(1.0, w))
+    h = max(0.001, min(1.0, h))
+    
+    return [x_center, y_center, w, h]
+
+def process_flir_split_CORRECTED(flir_base_path, output_base_path, split_name, target_size=(640, 512)):
+    """CORRECTED: Process a single split (train/val/test) of FLIR data with proper bbox normalization"""
+    
+    # Define paths based on split
+    if split_name == 'test':
+        thermal_folder = 'video_thermal_test'
+    else:
+        thermal_folder = f'images_thermal_{split_name}'
+    
+    thermal_path = os.path.join(flir_base_path, thermal_folder)
+    coco_file = os.path.join(thermal_path, 'coco.json')
+    images_folder = os.path.join(thermal_path, 'data')
+    
+    if not os.path.exists(coco_file):
+        print(f"Warning: {coco_file} not found, skipping {split_name}")
+        return
+    
+    # Load annotations
+    print(f"Processing FLIR {split_name} split...")
+    image_id_to_info, category_id_to_name, annotations_by_image = load_coco_annotations(coco_file)
+    
+    # Get class mapping
+    flir_to_yolo_classes, class_names = get_flir_class_mapping()
+    
+    # Output paths
+    output_images_path = os.path.join(output_base_path, 'main_dataset', split_name, 'images')
+    output_labels_path = os.path.join(output_base_path, 'main_dataset', split_name, 'labels')
+    
+    processed_count = 0
+    skipped_count = 0
+    coordinate_errors = 0
+    
+    # Process each image
+    for image_id, image_info in image_id_to_info.items():
+        image_filename = image_info['file_name']
+        
+        # Fix path issue - remove "data/" prefix if it exists in filename
+        if image_filename.startswith('data/'):
+            image_filename = image_filename[5:]
+        
+        image_path = os.path.join(images_folder, image_filename)
+        
+        if not os.path.exists(image_path):
+            print(f"Warning: Image {image_path} not found")
+            skipped_count += 1
+            continue
+        
+        # Load original image to get ORIGINAL dimensions (CRITICAL!)
+        original_image = cv2.imread(image_path)
+        if original_image is None:
+            print(f"Warning: Could not load image {image_path}")
+            skipped_count += 1
+            continue
+        
+        # Get ORIGINAL dimensions before any resizing
+        original_height, original_width = original_image.shape[:2]
+        
+        # Process annotations for this image USING ORIGINAL DIMENSIONS
+        yolo_annotations = []
+        if image_id in annotations_by_image:
+            for ann in annotations_by_image[image_id]:
+                category_id = ann['category_id']
+                category_name = category_id_to_name.get(category_id, 'unknown')
+                
+                # Map to YOLO class
+                if category_name.lower() in flir_to_yolo_classes:
+                    yolo_class_id = flir_to_yolo_classes[category_name.lower()]
+                    
+                    # Convert bbox to YOLO format using ORIGINAL image dimensions
+                    bbox = ann['bbox']
+                    yolo_bbox = coco_to_yolo_bbox_CORRECTED(bbox, original_width, original_height)
+                    
+                    # Validate the converted bbox
+                    x_center, y_center, width, height = yolo_bbox
+                    if (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
+                        0 < width <= 1 and 0 < height <= 1):
+                        yolo_annotations.append([yolo_class_id] + yolo_bbox)
+                    else:
+                        coordinate_errors += 1
+                        print(f"Warning: Invalid coordinates in {image_filename}: {yolo_bbox}")
+        
+        # NOW resize the image (after bbox conversion)
+        resized_image = cv2.resize(original_image, target_size)
+        
+        # Create unique filename
+        clean_filename = os.path.basename(image_filename)
+        base_name = os.path.splitext(clean_filename)[0]
+        extension = os.path.splitext(clean_filename)[1]
+        unique_filename = f"flir_{split_name}_{base_name}{extension}"
+        
+        # Save resized image
+        output_image_path = os.path.join(output_images_path, unique_filename)
+        cv2.imwrite(output_image_path, resized_image)
+        
+        # Save YOLO format label file
+        label_filename = os.path.splitext(unique_filename)[0] + '.txt'
+        label_path = os.path.join(output_labels_path, label_filename)
+        
+        with open(label_path, 'w') as f:
+            for annotation in yolo_annotations:
+                class_id, x_center, y_center, width, height = annotation
+                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+        
+        processed_count += 1
+        if processed_count % 100 == 0:
+            print(f"  Processed {processed_count} images...")
+    
+    print(f"  Completed FLIR {split_name}: {processed_count} images processed, {skipped_count} skipped")
+    if coordinate_errors > 0:
+        print(f"  Warning: {coordinate_errors} coordinate errors found")
+
+def create_dataset_yaml(base_path, class_names):
+    """Create data.yaml file for YOLO training"""
+    yaml_content = f"""# FLIR ADAS Thermal Dataset Configuration - CORRECTED
+path: {os.path.abspath(os.path.join(base_path, 'main_dataset'))}
+train: train/images
+val: val/images
+test: test/images
+
+# Number of classes
+nc: {len(class_names)}
+
+# Class names
+names: {class_names}
+
+# Processing: CORRECTED coordinate normalization using original image dimensions
+"""
+    
+    yaml_path = os.path.join(base_path, 'main_dataset', 'data.yaml')
+    with open(yaml_path, 'w') as f:
+        f.write(yaml_content)
+    
+    print(f"Created data.yaml at {yaml_path}")
+
+def validate_sample_annotations(base_path, num_samples=5):
+    """Validate a few sample annotations to ensure they look correct"""
+    print(f"\n🔍 VALIDATING SAMPLE ANNOTATIONS")
+    print("=" * 50)
+    
+    train_labels_path = os.path.join(base_path, 'main_dataset', 'train', 'labels')
+    if not os.path.exists(train_labels_path):
+        print("No training labels found for validation")
+        return
+    
+    label_files = [f for f in os.listdir(train_labels_path) if f.endswith('.txt')][:num_samples]
+    
+    for label_file in label_files:
+        label_path = os.path.join(train_labels_path, label_file)
+        print(f"\n📄 {label_file}:")
+        
+        try:
+            with open(label_path, 'r') as f:
+                lines = f.readlines()
+            
+            valid_count = 0
+            invalid_count = 0
+            
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    try:
+                        class_id = int(parts[0])
+                        x, y, w, h = map(float, parts[1:5])
+                        
+                        # Check if coordinates are in valid range
+                        if (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+                            valid_count += 1
+                        else:
+                            invalid_count += 1
+                            print(f"   ⚠️  Invalid: class={class_id}, x={x:.3f}, y={y:.3f}, w={w:.3f}, h={h:.3f}")
+                    except ValueError:
+                        invalid_count += 1
+            
+            print(f"   ✅ Valid annotations: {valid_count}")
+            if invalid_count > 0:
+                print(f"   ❌ Invalid annotations: {invalid_count}")
+            else:
+                print(f"   🎯 All coordinates properly normalized!")
+                
+        except Exception as e:
+            print(f"   Error reading file: {e}")
+
+def main():
+    # Set paths
+    base_path = r"D:\datasets"
+    flir_path = os.path.join(base_path, "FLIR_ADAS_v2")
+    
+    # Verify FLIR dataset exists
+    if not os.path.exists(flir_path):
+        print(f"Error: FLIR dataset not found at {flir_path}")
+        return
+    
+    print("🚀 STARTING CORRECTED FLIR ADAS v2 PREPROCESSING")
+    print("=" * 60)
+    print(f"Source: {flir_path}")
+    print(f"Output: {os.path.join(base_path, 'main_dataset')}")
+    print("🔧 CORRECTION: Using original image dimensions for bbox normalization")
+    print("=" * 60)
+    
+    # Create directory structure
+    create_directory_structure(base_path)
+    
+    # Process each split
+    splits = ['train', 'val', 'test']
+    for split in splits:
+        process_flir_split_CORRECTED(flir_path, base_path, split, target_size=(640, 512))
+    
+    # Create dataset configuration
+    _, class_names = get_flir_class_mapping()
+    create_dataset_yaml(base_path, class_names)
+    
+    # Validate sample annotations
+    validate_sample_annotations(base_path)
+    
+    print("\n✅ CORRECTED FLIR ADAS v2 preprocessing completed!")
+    print("📊 Summary:")
+    print("   - Images resized to 640x512 for FLIR ADK compatibility")  
+    print("   - Bounding boxes normalized using ORIGINAL image dimensions")
+    print("   - All coordinates should now be in valid [0,1] range")
+    print("\nReady for next dataset!")
+
+if __name__ == "__main__":
+    main()
