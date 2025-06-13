@@ -26,9 +26,10 @@ FFC_TEMP_DRIFT = 1.5  # degrees Celsius
 TEMP_CHECK_INTERVAL = 5  # seconds
 
 # Tracking Config
-IOU_WEIGHT = 0.6
-DISTANCE_WEIGHT = 0.4
-MAX_DISTANCE = 100  # pixels
+IOU_WEIGHT = 0.5        # Reduced from 0.6
+DISTANCE_WEIGHT = 0.3   # Reduced from 0.4  
+VELOCITY_WEIGHT = 0.2   # New component
+MAX_DISTANCE = 100      # pixels
 MATCH_THRESHOLD = 0.5
 
 # ───── Camera Class ──────────────────────────────────────────────────────────
@@ -115,7 +116,6 @@ class FPSCounter:
         cv2.putText(frame, text3, (15, 75), font, 0.5, (255, 255, 0), 1)
 
 # ───── Temporal Detection Tracker ────────────────────────────────────────────
-# ───── Temporal Detection Tracker ────────────────────────────────────────────
 class TemporalDetectionTracker:
     def __init__(self):
         self.tracks = {}
@@ -195,7 +195,7 @@ class TemporalDetectionTracker:
         return np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
 
     def compute_cost_matrix(self, detections, track_bboxes, track_classes):
-        """Compute hybrid cost matrix using IOU and centroid distance"""
+        """Compute hybrid cost matrix using IOU, centroid distance, and velocity consistency"""
         n_det = len(detections)
         n_tracks = len(track_bboxes)
         cost_matrix = np.ones((n_det, n_tracks)) * 1e6  # Large cost for impossible matches
@@ -203,26 +203,56 @@ class TemporalDetectionTracker:
         for i, det in enumerate(detections):
             det_bbox = det['bbox']
             det_class = det['class_id']
+            det_centroid = self._get_centroid(det_bbox)
             
             for j, (track_bbox, track_class) in enumerate(zip(track_bboxes, track_classes)):
                 # Skip if different class
                 if det_class != track_class:
                     continue
                 
-                # Compute IOU score (1 - IOU so lower is better)
+                tid = list(self.tracks.keys())[j]
+                track = self.tracks[tid]
+                
+                # 1. IOU cost (1 - IOU so lower is better)
                 iou = self.compute_iou(det_bbox, track_bbox)
                 iou_cost = 1.0 - iou
                 
-                # Compute distance score (normalized)
+                # 2. Distance cost (normalized)
                 dist = self.compute_distance(det_bbox, track_bbox)
                 dist_cost = min(dist / MAX_DISTANCE, 1.0)
                 
-                # Hybrid cost
-                cost = IOU_WEIGHT * iou_cost + DISTANCE_WEIGHT * dist_cost
+                # 3. Velocity consistency cost
+                # Get predicted position based on velocity
+                state = track['kalman'].statePost
+                vx, vy = state[4, 0], state[5, 0]
+                track_centroid = self._get_centroid(track_bbox)
+                
+                # Where we expect the centroid to be based on velocity
+                expected_x = track_centroid[0] + vx
+                expected_y = track_centroid[1] + vy
+                
+                # Distance from expected position
+                velocity_error = np.sqrt((det_centroid[0] - expected_x)**2 + 
+                                       (det_centroid[1] - expected_y)**2)
+                
+                # Normalize velocity cost (adaptive based on speed)
+                speed = np.sqrt(vx**2 + vy**2)
+                if speed < 2.0:  # Nearly stationary
+                    # Don't heavily penalize velocity mismatch for slow objects
+                    velocity_cost = min(velocity_error / 50.0, 1.0) * 0.5
+                else:
+                    # For moving objects, velocity consistency is more important
+                    velocity_cost = min(velocity_error / 30.0, 1.0)
+                
+                # Hybrid cost with three components
+                cost = (IOU_WEIGHT * iou_cost + 
+                       DISTANCE_WEIGHT * dist_cost + 
+                       VELOCITY_WEIGHT * velocity_cost)
+                
                 cost_matrix[i, j] = cost
         
         return cost_matrix
-
+        
     def update(self, detections):
         self.frame_count += 1
         
