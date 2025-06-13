@@ -1,8 +1,11 @@
 import cv2
 import numpy as np
 import time
+import torch
 from ultralytics import YOLO
 from collections import deque
+from flirpy.camera.boson import Boson
+from scipy.optimize import linear_sum_assignment
 
 # ───── CONFIG ────────────────────────────────────────────────────────────────
 ENGINE_PATH = '/home/ibrahim/models/best.engine'
@@ -17,23 +20,73 @@ MAX_FRAMES_MISSING = 2
 CONFIDENCE_HISTORY_SIZE = 5
 IOU_MATCH_THRESHOLD = 0.3
 
+# FFC Config
+FFC_INTERVAL = 180  # 3 minutes in seconds
+FFC_TEMP_DRIFT = 1.5  # degrees Celsius
+TEMP_CHECK_INTERVAL = 5  # seconds
+
+# Tracking Config
+IOU_WEIGHT = 0.6
+DISTANCE_WEIGHT = 0.4
+MAX_DISTANCE = 100  # pixels
+MATCH_THRESHOLD = 0.5
+
 # ───── Camera Class ──────────────────────────────────────────────────────────
 class FLIRCamera:
-    def __init__(self, src=0):
-        self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, LIVE_W)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, LIVE_H)
-        self.cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.cap.isOpened():
-            print('Camera open failed')
-            exit(1)
+    def __init__(self):
+        self.cam = Boson()
+        self.last_ffc_time = time.time()
+        self.last_ffc_temp = None
+        self.last_temp_check = time.time()
+        # Perform initial FFC
+        self.do_ffc()
+    
+    def do_ffc(self):
+        """Perform flat field correction"""
+        print("Performing FFC...")
+        self.cam.do_ffc()
+        self.last_ffc_time = time.time()
+        self.last_ffc_temp = self.cam.get_fpa_temperature()
+        print(f"FFC complete. FPA temp: {self.last_ffc_temp:.1f}°C")
+    
+    def check_ffc_needed(self):
+        """Check if FFC is needed based on time or temperature drift"""
+        current_time = time.time()
+        
+        # Check every 5 seconds
+        if current_time - self.last_temp_check < TEMP_CHECK_INTERVAL:
+            return
+        
+        self.last_temp_check = current_time
+        
+        # Check time since last FFC
+        if current_time - self.last_ffc_time >= FFC_INTERVAL:
+            self.do_ffc()
+            return
+        
+        # Check temperature drift
+        current_temp = self.cam.get_fpa_temperature()
+        if self.last_ffc_temp is not None:
+            temp_drift = abs(current_temp - self.last_ffc_temp)
+            if temp_drift >= FFC_TEMP_DRIFT:
+                print(f"Temperature drift: {temp_drift:.1f}°C")
+                self.do_ffc()
     
     def read(self):
-        return self.cap.read()
+        """Read frame from Boson camera"""
+        frame = self.cam.grab()
+        if frame is not None:
+            # Convert to 8-bit if needed
+            if frame.dtype != np.uint8:
+                frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            # Convert to BGR for OpenCV
+            if len(frame.shape) == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            return True, frame
+        return False, None
     
     def release(self):
-        self.cap.release()
+        self.cam.close()
 
 # ───── FPS Counter ───────────────────────────────────────────────────────────
 class FPSCounter:
@@ -94,6 +147,10 @@ class TemporalDetectionTracker:
         y2 = cy + h / 2
         return [x1, y1, x2, y2]
 
+    def _get_centroid(self, bbox):
+        """Get centroid of bbox"""
+        return [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+
     def compute_iou(self, box1, box2):
         x1 = max(box1[0], box2[0])
         y1 = max(box1[1], box2[1])
@@ -105,56 +162,133 @@ class TemporalDetectionTracker:
         union = area1 + area2 - inter
         return inter / union if union > 0 else 0
 
+    def compute_distance(self, bbox1, bbox2):
+        """Compute Euclidean distance between centroids"""
+        c1 = self._get_centroid(bbox1)
+        c2 = self._get_centroid(bbox2)
+        return np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+
+    def compute_cost_matrix(self, detections, track_bboxes, track_classes):
+        """Compute hybrid cost matrix using IOU and centroid distance"""
+        n_det = len(detections)
+        n_tracks = len(track_bboxes)
+        cost_matrix = np.ones((n_det, n_tracks)) * 1e6  # Large cost for impossible matches
+        
+        for i, det in enumerate(detections):
+            det_bbox = det['bbox']
+            det_class = det['class_id']
+            
+            for j, (track_bbox, track_class) in enumerate(zip(track_bboxes, track_classes)):
+                # Skip if different class
+                if det_class != track_class:
+                    continue
+                
+                # Compute IOU score (1 - IOU so lower is better)
+                iou = self.compute_iou(det_bbox, track_bbox)
+                iou_cost = 1.0 - iou
+                
+                # Compute distance score (normalized)
+                dist = self.compute_distance(det_bbox, track_bbox)
+                dist_cost = min(dist / MAX_DISTANCE, 1.0)
+                
+                # Hybrid cost
+                cost = IOU_WEIGHT * iou_cost + DISTANCE_WEIGHT * dist_cost
+                cost_matrix[i, j] = cost
+        
+        return cost_matrix
+
     def update(self, detections):
         self.frame_count += 1
+        
+        # Predict all tracks
         for track in self.tracks.values():
             track['frames_missing'] += 1
             track['kalman'].predict()
-
-        matched_ids = set()
-        for det in detections:
-            bbox, class_id, conf = det['bbox'], det['class_id'], det['conf']
-            best_id, best_iou = None, IOU_MATCH_THRESHOLD
-            for tid, t in self.tracks.items():
-                if t['class_id'] != class_id:
-                    continue
-                iou = self.compute_iou(bbox, self._get_bbox_from_state(t['kalman'].statePost))
-                if iou > best_iou:
-                    best_iou, best_id = iou, tid
-            if best_id is not None:
-                t = self.tracks[best_id]
-                cx = (bbox[0] + bbox[2]) / 2
-                cy = (bbox[1] + bbox[3]) / 2
-                w = bbox[2] - bbox[0]
-                h = bbox[3] - bbox[1]
-                measurement = np.array([cx, cy, w, h], dtype=np.float32).reshape(-1, 1)
-                t['kalman'].correct(measurement)
-                t['conf_history'].append(conf)
-                t['frames_detected'] += 1
-                t['frames_missing'] = 0
-                t['last_seen'] = self.frame_count
-                if not t['confirmed'] and t['frames_detected'] >= MIN_FRAMES_FOR_DETECTION:
-                    t['confirmed'] = True
-                matched_ids.add(best_id)
-            else:
-                kf = self._init_kalman(bbox)
-                self.tracks[self.next_id] = {
-                    'kalman': kf,
-                    'class_id': class_id,
-                    'conf_history': deque([conf], maxlen=CONFIDENCE_HISTORY_SIZE),
-                    'frames_detected': 1,
-                    'frames_missing': 0,
-                    'first_seen': self.frame_count,
-                    'last_seen': self.frame_count,
-                    'confirmed': False,
-                    'id': self.next_id
+        
+        if not detections or not self.tracks:
+            # No matching needed
+            if not detections:
+                # Remove dead tracks
+                self.tracks = {
+                    tid: t for tid, t in self.tracks.items()
+                    if t['frames_missing'] <= MAX_FRAMES_MISSING
                 }
-                self.next_id += 1
-
+            else:
+                # All detections are new
+                for det in detections:
+                    self._create_new_track(det)
+            return
+        
+        # Prepare track data
+        track_ids = list(self.tracks.keys())
+        track_bboxes = [self._get_bbox_from_state(self.tracks[tid]['kalman'].statePost) 
+                        for tid in track_ids]
+        track_classes = [self.tracks[tid]['class_id'] for tid in track_ids]
+        
+        # Compute cost matrix
+        cost_matrix = self.compute_cost_matrix(detections, track_bboxes, track_classes)
+        
+        # Hungarian algorithm
+        det_indices, track_indices = linear_sum_assignment(cost_matrix)
+        
+        # Process matches
+        matched_dets = set()
+        for det_idx, track_idx in zip(det_indices, track_indices):
+            if cost_matrix[det_idx, track_idx] < MATCH_THRESHOLD:
+                # Valid match
+                det = detections[det_idx]
+                tid = track_ids[track_idx]
+                self._update_track(tid, det)
+                matched_dets.add(det_idx)
+        
+        # Create new tracks for unmatched detections
+        for i, det in enumerate(detections):
+            if i not in matched_dets:
+                self._create_new_track(det)
+        
+        # Remove dead tracks
         self.tracks = {
             tid: t for tid, t in self.tracks.items()
             if t['frames_missing'] <= MAX_FRAMES_MISSING
         }
+
+    def _update_track(self, track_id, detection):
+        """Update existing track with new detection"""
+        t = self.tracks[track_id]
+        bbox = detection['bbox']
+        
+        # Kalman correction
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        measurement = np.array([cx, cy, w, h], dtype=np.float32).reshape(-1, 1)
+        t['kalman'].correct(measurement)
+        
+        # Update track info
+        t['conf_history'].append(detection['conf'])
+        t['frames_detected'] += 1
+        t['frames_missing'] = 0
+        t['last_seen'] = self.frame_count
+        
+        if not t['confirmed'] and t['frames_detected'] >= MIN_FRAMES_FOR_DETECTION:
+            t['confirmed'] = True
+
+    def _create_new_track(self, detection):
+        """Create new track from detection"""
+        kf = self._init_kalman(detection['bbox'])
+        self.tracks[self.next_id] = {
+            'kalman': kf,
+            'class_id': detection['class_id'],
+            'conf_history': deque([detection['conf']], maxlen=CONFIDENCE_HISTORY_SIZE),
+            'frames_detected': 1,
+            'frames_missing': 0,
+            'first_seen': self.frame_count,
+            'last_seen': self.frame_count,
+            'confirmed': False,
+            'id': self.next_id
+        }
+        self.next_id += 1
 
     def get_confirmed_detections(self):
         return [
@@ -185,7 +319,14 @@ def draw_detections(frame, detections, model):
 def main():
     print("Initializing...")
     model = YOLO(ENGINE_PATH)
-    cam = FLIRCamera(0)
+    
+    # Warm up model with dummy frame
+    print("Warming up model...")
+    dummy_frame = np.zeros((LIVE_H, LIVE_W, 3), dtype=np.uint8)
+    with torch.no_grad():
+        _ = model(dummy_frame)
+    
+    cam = FLIRCamera()
     fps_counter = FPSCounter()
     tracker = TemporalDetectionTracker()
 
@@ -195,9 +336,16 @@ def main():
             if not ret:
                 continue
 
+            # Check if FFC is needed
+            cam.check_ffc_needed()
+
             fps_counter.update()
             t0 = time.time()
-            results = model(frame)
+            
+            # Run inference without gradient computation
+            with torch.no_grad():
+                results = model(frame)
+            
             inference_ms = (time.time() - t0) * 1000
 
             boxes = results[0].boxes
