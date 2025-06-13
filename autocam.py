@@ -115,6 +115,7 @@ class FPSCounter:
         cv2.putText(frame, text3, (15, 75), font, 0.5, (255, 255, 0), 1)
 
 # ───── Temporal Detection Tracker ────────────────────────────────────────────
+# ───── Temporal Detection Tracker ────────────────────────────────────────────
 class TemporalDetectionTracker:
     def __init__(self):
         self.tracks = {}
@@ -122,21 +123,46 @@ class TemporalDetectionTracker:
         self.frame_count = 0
 
     def _init_kalman(self, bbox):
-        """Initialize a Kalman filter for a bounding box [x1, y1, x2, y2]"""
+        """Initialize a Kalman filter optimized for thermal human/animal tracking from moving vehicle"""
         x1, y1, x2, y2 = bbox
         kf = cv2.KalmanFilter(8, 4)
+        
+        # Measurement matrix [x, y, w, h] from state [x, y, w, h, vx, vy, vw, vh]
         kf.measurementMatrix = np.eye(4, 8, dtype=np.float32)
+        
+        # State transition matrix - constant velocity model
         kf.transitionMatrix = np.eye(8, dtype=np.float32)
         for i in range(4):
             kf.transitionMatrix[i, i+4] = 1  # velocity terms
-
-        kf.processNoiseCov = np.eye(8, dtype=np.float32) * 1e-2
-        kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1e-1
-        kf.statePost = np.array([
-            (x1 + x2) / 2, (y1 + y2) / 2,
-            x2 - x1, y2 - y1,
-            0, 0, 0, 0
-        ], dtype=np.float32).reshape(-1, 1)
+        
+        # Process noise covariance - ADJUSTED FOR VEHICLE MOTION
+        kf.processNoiseCov = np.eye(8, dtype=np.float32)
+        kf.processNoiseCov[0, 0] = 0.1   # x position - high due to vehicle motion
+        kf.processNoiseCov[1, 1] = 0.1   # y position - high due to vehicle motion  
+        kf.processNoiseCov[2, 2] = 0.02  # width - humans/animals don't change size much
+        kf.processNoiseCov[3, 3] = 0.02  # height - humans/animals don't change size much
+        kf.processNoiseCov[4, 4] = 0.5   # x velocity - high for unpredictable motion
+        kf.processNoiseCov[5, 5] = 0.5   # y velocity - high for unpredictable motion
+        kf.processNoiseCov[6, 6] = 0.01  # width velocity - very low
+        kf.processNoiseCov[7, 7] = 0.01  # height velocity - very low
+        
+        # Measurement noise covariance - ADJUSTED FOR THERMAL IMAGERY
+        kf.measurementNoiseCov = np.eye(4, dtype=np.float32)
+        kf.measurementNoiseCov[0, 0] = 0.5  # x measurement noise
+        kf.measurementNoiseCov[1, 1] = 0.5  # y measurement noise
+        kf.measurementNoiseCov[2, 2] = 0.3  # width measurement noise  
+        kf.measurementNoiseCov[3, 3] = 0.3  # height measurement noise
+        
+        # Initial state
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        w = x2 - x1
+        h = y2 - y1
+        kf.statePost = np.array([cx, cy, w, h, 0, 0, 0, 0], dtype=np.float32).reshape(-1, 1)
+        
+        # Error covariance - start with higher uncertainty
+        kf.errorCovPost = np.eye(8, dtype=np.float32) * 10.0
+        
         return kf
 
     def _get_bbox_from_state(self, state):
