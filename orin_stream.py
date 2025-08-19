@@ -16,13 +16,7 @@ import glob
 from datetime import datetime, timedelta
 import shutil
 
-# WiFi Config - Primary (Car)
-PRIMARY_WIFI_SSID = "Che Che_5GHz"
-PRIMARY_WIFI_PASSWORD = "qIgvcr0gF8xE"
 
-# WiFi Config - Secondary (Home)
-SECONDARY_WIFI_SSID = "bayt-5G"
-SECONDARY_WIFI_PASSWORD = "alsahouh"
 
 # WiFi Send Config
 CHUNK_PAYLOAD = 1000 # bytes of jpeg per UDP packet
