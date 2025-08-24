@@ -16,11 +16,11 @@ import glob
 from datetime import datetime, timedelta
 import shutil
 
-# WiFi Config - Primary (Car)
+# WiFi Config - Secondary (Car)
 PRIMARY_WIFI_SSID = ""
 PRIMARY_WIFI_PASSWORD = ""
 
-# WiFi Config - Secondary (Home)
+# WiFi Config - Primary (Home)
 SECONDARY_WIFI_SSID = ""
 SECONDARY_WIFI_PASSWORD = ""
 
